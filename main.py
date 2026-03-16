@@ -1,5 +1,11 @@
 from ollama import chat
 
+'''
+Agent Loop order (LangChain)
+LLM Reasoning -> Call tool -> Observe result -> store in mem -> repeat
+'''
+
+
 messages = [
     {
         "role" : "user",
