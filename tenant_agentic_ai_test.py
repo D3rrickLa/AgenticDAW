@@ -96,24 +96,11 @@ class Memory:
 
 memory = Memory()
 
-def llm(prompt, use_tools=False) -> ChatResponse:
+def llm(messages: list[str]) -> ChatResponse:
     response = chat(
         model=MODEL,
-        messages=[
-            {
-                {
-                "role": "system",
-                "content": (
-                    "You are a helpful agent with access to tools. "
-                    "Always use the provided tools to look up real data rather than guessing. "
-                    "When you have a definitive answer, state it clearly in plain text."
-                )
-            },
-            },
-            {"role": "user", "content": prompt}
-        ],
-        tools=OLLAMA_TOOLS if use_tools else None,
-        stream=True
+        messages=messages,
+        tools=OLLAMA_TOOLS  
     )
     return response
 
@@ -124,74 +111,127 @@ def agent_loop(goal, max_steps=6):
       user message → model → tool_calls? → execute → append result → repeat
     until the model replies with plain text (no more tool calls).
     """
-    history = memory.get("history") or []
+    history = memory.get("history") or [] 
 
-    for step in range(max_steps):
-        print(f"\n--- STEP {step + 1} ---")
-
-        # Include history in prompt so the model can reason over previous results
-        response = llm(
+    messages = [{
+        "role": "system",
+        "content": (
             f"""
-            You are an agent. Your goal: {goal}
-            Previous results: {history}
-
-            Use the relevant tools: calculator, tenant_lookup, tenant_list, tenant_is_owner.
-            Return your final answer explicitly as: "FINAL: <answer>"
+                You are an agent. Your goal: {goal}
+                Previous results: {history}
+                Use the relevant tools: calculator, tenant_lookup, tenant_list, tenant_is_owner.
+                If you want to use a tool, return JSON like:
+                {{ "tool": "<tool_name>", "input": "<arg>" }}
+                When done, return your final answer explicitly as: FINAL: <answer>
             """
-        )
+            )
+        },
+        {"role": "user", "content": goal}
+    ]
+    response = llm(messages)
+    msg = response.message
 
-        # if "tool" in text:
-        #     try:
-        #         data = json.loads(text)
-        #     except:
-        #         print("Model did not return JSON:", text)
-        #         continue
+    # Persist the assistant turn in converstaion history
+    messages.append({
+        "role": "assistant",
+        "content": msg.content or "",
+        "tool_calls": msg.tool_calls or [],
+    })
 
-        #     tool_name = data["tool"]
-        #     arg = data.get("input")
-        #     result = TOOLS[tool_name](arg)
+    if msg.tool_calls:
+        #  Detect tool calls via the structured API field, not text heuristics
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            args = tc.function.arguments or {}
+            print(f"[tool] {name}({args})")
 
-        #     history.append(result)
-        #     memory.set("history", history)
+            result = TOOLS[name](args) if name in TOOLS else {"error": f"unknown tool: {name}"}
+            print(f"[result] {result}")
 
-        #     continue
+            # Append tool result so the model can read it on the next turn
+            messages.append({
+                "role": "tool",
+                "content": json.dumps(result),
+            })
+    else:
+        # No tool calls → model is done reasoning, return its answer
+        print(f"[answer] {msg.content}")
+        return msg.content or ""
+ 
+    return "Max steps reached without a final answer."
 
-        # if text.startswith("FINAL:"):
-        #     return text
+    
 
+def plan(goal: str) -> list[str]:
+    prompt = (
+        "Break the following task into 2–4 clear, actionable steps. "
+        "Return ONLY a JSON array of strings with no explanation or markdown.\n\n"
+        f"Task: {goal}"
+    )
+    message = [{"role": "user", "content" : prompt}]
+    response = llm(message)
+    text = response.message.content.strip()
+ 
+    # Strip ``` fences that some models add despite being told not to
+    if "```" in text:
+        text = text.split("```")[1].lstrip("json").strip()
+ 
+    try:
+        steps = json.loads(text)
+        if isinstance(steps, list):
+            return [str(s) for s in steps]
+    except json.JSONDecodeError:
+        pass
+ 
+    # Fallback: one step per non-empty line
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
-def plan(goal):
-    p = llm(f"Break this task into 3 short steps:\n{goal}")
-    print(p)
-    return p
+def reflect(step: str, answer: str) -> bool:
+    prompt = (
+        f"Step: {step}\n"
+        f"Answer: {answer}\n\n"
+        "Is this answer correct and complete for the step above? "
+        "Reply with ONLY the word YES or NO."
+    )
+    message = [{"role": "user", "content" : prompt}]
+    response = llm(message)
 
-def reflect(answer, context=None):
-    prompt = f"""
-        Step: {context}
-        Answer: {answer}
-        Is this answer correct for the step? Respond ONLY with YES or NO.
-        """
-    r = llm(prompt)
-    print("Reflection:", r)
-    return r
+    verdict = response.message.content.strip().upper()
+    passed = verdict.startswith("YES")
+    print(f"  [reflect] {verdict} → {'pass' if passed else 'RETRY'}")
+    return passed
 
-def multi_agent(goal):
+def multi_agent(goal: str, max_retries: int = 2) -> list[str]:
     print("\n=== PLANNING ===")
-    steps_text = plan(goal)
-    steps = [s for s in steps_text.split("\n") if s.strip() and s.strip()[0] in "123"]
+    steps = plan(goal)
+    for i, s in enumerate(steps, 1):
+        print(f"  {i}. {s}")
 
     results = []
-    last_result = None
+    original_steps = list(steps)
+ 
     for step in steps:
-        print(f"\n=== WORKER executing: {step} ===")
-        result = agent_loop(step)
-        last_result = result
-        results.append(result)
-
-        print("\n=== REVIEWER ===")
-        reflect(result, context=step)
-
+        print(f"\n=== WORKER: {step} ===")
+        answer = None
+ 
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                print(f"\n  [retry {attempt}/{max_retries}]")
+                # Give the model a hint about what went wrong
+                step = f"{step}  (previous attempt gave wrong answer: {answer!r} — try again using tools)"
+ 
+            answer = agent_loop(step)
+ 
+            print(f"\n=== REVIEWER ===")
+            if reflect(step, answer):
+                break   # now stops retries when satisfied
+ 
+        results.append(answer)
+ 
     print("\n=== FINAL RESULTS ===")
+    for step, result in zip(original_steps, results):
+        print(f"  • {step}\n    → {result}\n")
+ 
     return results
 
 if __name__ == "__main__":
