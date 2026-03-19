@@ -77,6 +77,17 @@ OLLAMA_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "tenant_apartment_number",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tenant_list",
             "parameters": {"type": "object", "properties": {}}
         }
