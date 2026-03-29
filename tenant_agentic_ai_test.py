@@ -167,103 +167,105 @@ def extract_tenant_name(goal: str):
 
     return None
 
+def extract_math_expr(goal: str):
+    match = re.search(r"[\d\.\+\-\*\/\(\)]+", goal)
+    return match.group() if match else None
+
+
+def extract_tenant_name(goal: str):
+    goal_lower = goal.lower()
+
+    for t in TENANTS:
+        if t["name"].lower() in goal_lower:
+            return t["name"]
+
+    return None
+
 # ---------------------------
 # AGENT LOOP
 # ---------------------------
-def agent_loop(goal: str, max_steps: int = 6) -> str:
+def agent_loop(goal: str) -> str:
     messages = [
         {
             "role": "system",
-"content": (
-    "You are a tool-using agent.\n"
-    "You MUST respond with JSON tool calls.\n"
-    "Never answer directly.\n"
-    "Use tools for ALL tenant data and math."
-)
-            
-        },
-        {"role": "user", "content": "Is Alice Johnson an owner?"},
-        {
-            "role": "assistant",
-            "content": '{"name": "tenant_is_owner", "arguments": {"name": "Alice Johnson"}}'
+            "content": (
+                "You are a tool-using agent.\n"
+                "You MUST respond with JSON tool calls.\n"
+                "Never answer directly.\n"
+                "Use tools for ALL tenant data and math."
+            )
         },
         {"role": "user", "content": goal}
     ]
 
-    for step in range(max_steps):
-        print(f"\n--- step {step+1} ---")
+    results = []
 
-        response = llm(messages)
-        msg = response.message
+    # ---------------------------
+    # Try LLM tool calls first
+    # ---------------------------
+    response = llm(messages)
+    msg = response.message
+    content = msg.content or ""
+    messages.append({"role": "assistant", "content": safe_content(content)})
 
-        content = msg.content or ""
+    # If LLM returned a structured tool call
+    name, args = parse_tool_call_from_text(content)
+    if name:
+        print(f"[tool] {name}({args})")
+        try:
+            result = TOOLS[name](**args)
+        except Exception as e:
+            result = {"error": str(e)}
+        print(f"[result] {result}")
+        messages.append({"role": "tool", "name": name, "content": json.dumps(result)})
 
-        messages.append({
-            "role": "assistant",
-            "content": safe_content(content),
-        })
+        # Collect LLM tool call result
+        if name == "tenant_is_owner" and "error" not in result:
+            results.append(
+                f"{result['name']} is {'an owner' if result['is_owner'] else 'not an owner'}."
+            )
+        elif name == "calculator" and "result" in result:
+            results.append(f"{args['expr']} = {result['result']}")
 
-        name, args = parse_tool_call_from_text(content)
+    # ---------------------------
+    # Multi-intent fallback (deterministic)
+    # ---------------------------
 
-        if name:
-            print(f"[tool] {name}({args})")
+    # Tenant ownership check
+    if "owner" in goal.lower():
+        name_str = extract_tenant_name(goal)
+        if name_str:
+            print(f"[forced tenant_is_owner] {name_str}")
+            result = tenant_is_owner(name_str)
+            if "error" not in result:
+                results.append(
+                    f"{name_str} is {'an owner' if result['is_owner'] else 'not an owner'}."
+                )
 
-            try:
-                result = TOOLS[name](**args)
-            except Exception as e:
-                result = {"error": str(e)}
+    # Math calculation
+    if "calculate" in goal.lower() or re.search(r"[\d\.\+\-\*\/\(\)]", goal):
+        expr = extract_math_expr(goal)
+        if expr:
+            print(f"[forced calculator] {expr}")
+            result = calculator(expr)
+            if "result" in result:
+                results.append(f"{expr} = {result['result']}")
 
-            print(f"[result] {result}")
+    # ---------------------------
+    # Return combined results
+    # ---------------------------
+    if results:
+        final = " ".join(results)
+        print(f"[final answer] {final}")
+        return final
 
-            messages.append({
-                "role": "tool",
-                "name": name,
-                "content": json.dumps(result),
-            })
-
-            continue
-
-        if "owner" in goal.lower():
-            name_str = extract_tenant_name(goal)
-
-            if name_str:
-                print(f"[forced tenant_is_owner] {name_str}")
-
-                result = tenant_is_owner(name_str)
-
-                messages.append({
-                    "role": "tool",
-                    "name": "tenant_is_owner",
-                    "content": json.dumps(result),
-                })
-
-            return f"{name_str} is {'an owner' if result['is_owner'] else 'not an owner'}."
-
-        if "calculate" in goal.lower() or re.search(r"\d", goal):
-            expr_match = re.search(r"[\d\.\+\-\*\/\(\)]+", goal)
-
-            if expr_match:
-                expr = expr_match.group()
-                print(f"[forced calculator] {expr}")
-
-                result = calculator(expr)
-
-                messages.append({
-                    "role": "tool",
-                    "name": "calculator",
-                    "content": json.dumps(result),
-                })
-
-                continue
-
-    print(f"[final answer] {content}")
-    return content
+    return "No valid tool action detected."
 
 if __name__ == "__main__":
     # Try condo questions:
     # goal = "Is Bob Smith an owner?"
     # goal = "List every tenant in the building."
     # goal = "Which apartment does Alice Johnson live in?"
-    # goal = "Check if Carla Mendes is an owner and calculate 500*1.08"
-    goal = "Is Carla Mendes an owner?"
+    goal = "Check if Carla Mendes is an owner and calculate 500*1.08"
+    # goal = "Is Carla Mendes an owner?"
     print(agent_loop(goal))
