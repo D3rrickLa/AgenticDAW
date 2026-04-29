@@ -101,6 +101,13 @@ OLLAMA_TOOLS = [
             "name": "tenant_list",
             "parameters": {"type": "object", "properties": {}}
         }
+    },
+    {
+    "type": "function",
+        "function": {
+            "name": "tenant_apartment_number",
+            "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        }
     }
 ]
 
@@ -114,16 +121,10 @@ def safe_content(x):
 # TOOL PARSER
 # ---------------------------
 def parse_tool_call_from_text(text: str):
-    text = re.sub(r"```(json)?", "", text or "").strip()
-    match = re.search(r"\{.*?\}", text, re.DOTALL)
-    if not match:
-        return None, None
     try:
-        data = json.loads(match.group())
-        name = data.get("name") or data.get("tool") or data.get("function", {}).get("name")
-        args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
-        if isinstance(args, str):
-            args = json.loads(args)
+        data = json.loads(text)
+        name = data.get("name")
+        args = data.get("arguments", {})
         if name in TOOLS:
             return name, args
     except Exception:
@@ -141,90 +142,125 @@ def extract_tenant_name(goal: str):
             return t["name"]
     return None
 
-def execute_multi_intent(goal: str):
-    """Deterministically handle tenant + calculation intents."""
-    results = []
-
-    # Tenant ownership check
-    if "owner" in goal.lower():
-        name_str = extract_tenant_name(goal)
-        if name_str:
-            print(f"[forced tenant_is_owner] {name_str}")
-            result = tenant_is_owner(name_str)
-            if "error" not in result:
-                results.append(
-                    f"{name_str} is {'an owner' if result['is_owner'] else 'not an owner'}."
-                )
-
-    # Math calculation
-    if "calculate" in goal.lower() or re.search(r"\d", goal):
-        expr = extract_math_expr(goal)
-        if expr:
-            print(f"[forced calculator] {expr}")
-            result = calculator(expr)
-            if "result" in result:
-                results.append(f"{expr} = {result['result']}")
-
-    return " ".join(results) if results else None
 # ---------------------------
 # AGENTIC AI: LLM-in-the-loop
 # ---------------------------
-def agentic_llm(goal: str, max_steps=6):
+def agentic_llm(goal: str, max_steps=8):
     messages = [
-        {"role": "system", "content": "You are a tool-using agent. Plan, reflect, and call tools to achieve the user's goal."},
+        {
+            "role": "system",
+            "content": f"""
+        You are an autonomous agent that can use tools.
+
+        Available tenants:
+        {TENANTS}
+
+        Guidelines:
+        - Think step-by-step (you may explain briefly)
+        - Use tools when needed
+        - After each tool result, decide what to do next
+        - When done, give a final answer
+
+        When calling a tool, use the tool system (not text).
+        Do not return empty responses.
+        """
+        },
         {"role": "user", "content": goal}
     ]
 
-    results = []
+    for step in range(max_steps):
+        print(f"\n--- Step {step+1} ---")
 
-    for step_num in range(max_steps):
-        print(f"\n--- Step {step_num+1} ---")
         response = llm(messages)
         msg = response.message
+
         content = msg.content or ""
-        messages.append({"role": "assistant", "content": safe_content(content)})
+        tool_calls = getattr(msg, "tool_calls", None)
 
-        # Try tool call
-        name, args = parse_tool_call_from_text(content)
-        if name:
-            print(f"[tool call] {name}({args})")
-            try:
-                result = TOOLS[name](**args)
-            except Exception as e:
-                result = {"error": str(e)}
-            print(f"[tool result] {result}")
-            messages.append({"role": "tool", "name": name, "content": json.dumps(result)})
-
-            # Reflect: ask LLM if result is enough to continue or retry
-            messages.append({"role": "user", "content": f"Did this tool call succeed for the goal? Result: {json.dumps(result)}"})
-            continue
-        if not name:
-            fallback_result = execute_multi_intent(goal)
-            if fallback_result:
-                results.append(fallback_result)
-                break
-        if "list" in goal.lower() and "tenant" in goal.lower():
-            print("[forced tenant_list]")
-            result = tenant_list()
-            return ", ".join([t["name"] for t in result["tenants"]])
-        
-        # Fallback: no tool, maybe LLM reasoning required
+        # ---------------------------
+        # PRINT REASONING (LIGHT)
+        # ---------------------------
         if content.strip():
-            print(f"[LLM reasoning] {content}")
-            results.append(content)
+            print(f"[THINK] {content}")
 
-    final_answer = " ".join(results)
-    print("\n=== FINAL AGENTIC ANSWER ===")
-    print(final_answer)
-    return final_answer
+        # ---------------------------
+        # TOOL CALLS
+        # ---------------------------
+        if tool_calls:
+            for call in tool_calls:
+                name = call["function"]["name"]
+                args = call["function"].get("arguments", {})
 
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        args = {}
+
+                print(f"[tool call] {name}({args})")
+
+                if name not in TOOLS:
+                    result = {"error": f"Unknown tool: {name}"}
+                else:
+                    try:
+                        result = TOOLS[name](**args)
+                    except Exception as e:
+                        result = {"error": str(e)}
+
+                print(f"[tool result] {result}")
+
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [call]
+                })
+
+                messages.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps(result)
+                })
+
+                # ---------------------------
+                # REFLECTION PROMPT (SOFT)
+                # ---------------------------
+                messages.append({
+                    "role": "user",
+                    "content": f"""
+                    Tool result: {json.dumps(result)}
+
+                    What did you learn from this?
+                    What should you do next?
+                    """
+                })
+
+            continue
+
+        # ---------------------------
+        # FINAL ANSWER
+        # ---------------------------
+        if content.strip():
+            print("\n=== FINAL ANSWER ===")
+            print(content)
+            return content
+
+        # ---------------------------
+        # FAILSAFE
+        # ---------------------------
+        print("[warning] empty response, nudging model")
+
+        messages.append({
+            "role": "user",
+            "content": "Please continue reasoning or give the final answer."
+        })
+
+    return "Failed to complete task."
 # ---------------------------
 # TEST
 # ---------------------------
 if __name__ == "__main__":
     goals = [
         "Check if Carla Mendes is an owner and calculate 500*1.08",
-        "Calculate 42 / 7 and check if Alice Johnson is an owner",
+        # "Calculate 42 / 7 and check if Alice Johnson is an owner",
         "List every tenant in the building."
     ]
     for g in goals:
