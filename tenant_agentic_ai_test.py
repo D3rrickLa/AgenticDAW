@@ -21,7 +21,6 @@ class SafeEval(ast.NodeVisitor):
         ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod,
         ast.USub
     )
-
     def visit(self, node):
         if not isinstance(node, self.ALLOWED_NODES):
             raise ValueError(f"Unsafe expression: {type(node).__name__}")
@@ -72,7 +71,7 @@ TOOLS = {
 }
 
 # ---------------------------
-# LLM CALLS
+# LLM CALL
 # ---------------------------
 OLLAMA_TOOLS = [
     {
@@ -95,6 +94,13 @@ OLLAMA_TOOLS = [
             "name": "tenant_lookup",
             "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tenant_list",
+            "parameters": {"type": "object", "properties": {}}
+        }
     }
 ]
 
@@ -105,101 +111,121 @@ def safe_content(x):
     return x if isinstance(x, str) else json.dumps(x)
 
 # ---------------------------
-# AGENTIC AI HELPERS
+# TOOL PARSER
 # ---------------------------
-def extract_math_expr(text: str):
-    match = re.search(r"[\d\.\+\-\*\/\(\)]+", text)
-    return match.group() if match else None
+def parse_tool_call_from_text(text: str):
+    text = re.sub(r"```(json)?", "", text or "").strip()
+    match = re.search(r"\{.*?\}", text, re.DOTALL)
+    if not match:
+        return None, None
+    try:
+        data = json.loads(match.group())
+        name = data.get("name") or data.get("tool") or data.get("function", {}).get("name")
+        args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
+        if isinstance(args, str):
+            args = json.loads(args)
+        if name in TOOLS:
+            return name, args
+    except Exception:
+        pass
+    return None, None
 
-def extract_tenant_name(text: str):
-    text_lower = text.lower()
+def extract_math_expr(goal: str):
+    matches = re.findall(r"[\d\.\+\-\*\/\(\)]+", goal)
+    return max(matches, key=len) if matches else None
+
+def extract_tenant_name(goal: str):
+    goal_lower = goal.lower()
     for t in TENANTS:
-        if t["name"].lower() in text_lower:
+        if t["name"].lower() in goal_lower:
             return t["name"]
     return None
 
-def detect_intents(goal: str):
-    """Ask LLM to propose tool steps or fallback to deterministic detection."""
-    intents = []
-    tenant_name = extract_tenant_name(goal)
-
-    if tenant_name:
-        if "owner" in goal.lower():
-            intents.append(("tenant_is_owner", {"name": tenant_name}))
-        elif "apartment" in goal.lower() or "live" in goal.lower():
-            intents.append(("tenant_apartment_number", {"name": tenant_name}))
-        else:
-            intents.append(("tenant_lookup", {"name": tenant_name}))
-
-    expr = extract_math_expr(goal)
-    if expr:
-        intents.append(("calculator", {"expr": expr}))
-
-    return intents
-
-def reflect(step, result):
-    """Decide if we should accept result or retry."""
-    if step["tool"] in ["tenant_is_owner", "tenant_apartment_number", "tenant_lookup"]:
-        return "error" not in result
-    if step["tool"] == "calculator":
-        return "result" in result
-    return True
-
-def execute_step(step):
-    tool = step.get("tool")
-    args = step.get("args", {})
-    if tool:
-        result = TOOLS[tool](**args)
-        # Human-readable formatting
-        if tool == "tenant_is_owner" and "error" not in result:
-            return f"{result['name']} is {'an owner' if result['is_owner'] else 'not an owner'}."
-        if tool == "tenant_apartment_number" and "error" not in result:
-            return f"{args['name']} lives in apartment {result['apartment']}."
-        if tool == "calculator" and "result" in result:
-            return f"{args['expr']} = {result['result']}"
-        return json.dumps(result)
-    return None
-
-def plan(goal: str):
-    steps = []
-    intents = detect_intents(goal)
-    for t, a in intents:
-        steps.append({"tool": t, "args": a})
-    if not steps:
-        steps = [{"tool": None, "raw": goal}]
-    return steps
-
-def agentic_loop(goal: str, max_steps=6):
-    print(f"\n=== Goal: {goal} ===")
-    steps = plan(goal)
+def execute_multi_intent(goal: str):
+    """Deterministically handle tenant + calculation intents."""
     results = []
 
-    for step in steps:
-        print(f"\n--- Step: {step} ---")
-        for attempt in range(3):
-            answer = execute_step(step)
-            if reflect(step, answer):
-                break
-            else:
-                print(f"[Retry {attempt+1}]")
-        results.append(answer)
+    # Tenant ownership check
+    if "owner" in goal.lower():
+        name_str = extract_tenant_name(goal)
+        if name_str:
+            print(f"[forced tenant_is_owner] {name_str}")
+            result = tenant_is_owner(name_str)
+            if "error" not in result:
+                results.append(
+                    f"{name_str} is {'an owner' if result['is_owner'] else 'not an owner'}."
+                )
 
-    final = " ".join(results)
-    print("\n=== Final Answer ===")
-    print(final)
-    return final
+    # Math calculation
+    if "calculate" in goal.lower() or re.search(r"\d", goal):
+        expr = extract_math_expr(goal)
+        if expr:
+            print(f"[forced calculator] {expr}")
+            result = calculator(expr)
+            if "result" in result:
+                results.append(f"{expr} = {result['result']}")
+
+    return " ".join(results) if results else None
+# ---------------------------
+# AGENTIC AI: LLM-in-the-loop
+# ---------------------------
+def agentic_llm(goal: str, max_steps=6):
+    messages = [
+        {"role": "system", "content": "You are a tool-using agent. Plan, reflect, and call tools to achieve the user's goal."},
+        {"role": "user", "content": goal}
+    ]
+
+    results = []
+
+    for step_num in range(max_steps):
+        print(f"\n--- Step {step_num+1} ---")
+        response = llm(messages)
+        msg = response.message
+        content = msg.content or ""
+        messages.append({"role": "assistant", "content": safe_content(content)})
+
+        # Try tool call
+        name, args = parse_tool_call_from_text(content)
+        if name:
+            print(f"[tool call] {name}({args})")
+            try:
+                result = TOOLS[name](**args)
+            except Exception as e:
+                result = {"error": str(e)}
+            print(f"[tool result] {result}")
+            messages.append({"role": "tool", "name": name, "content": json.dumps(result)})
+
+            # Reflect: ask LLM if result is enough to continue or retry
+            messages.append({"role": "user", "content": f"Did this tool call succeed for the goal? Result: {json.dumps(result)}"})
+            continue
+        if not name:
+            fallback_result = execute_multi_intent(goal)
+            if fallback_result:
+                results.append(fallback_result)
+                break
+        if "list" in goal.lower() and "tenant" in goal.lower():
+            print("[forced tenant_list]")
+            result = tenant_list()
+            return ", ".join([t["name"] for t in result["tenants"]])
+        
+        # Fallback: no tool, maybe LLM reasoning required
+        if content.strip():
+            print(f"[LLM reasoning] {content}")
+            results.append(content)
+
+    final_answer = " ".join(results)
+    print("\n=== FINAL AGENTIC ANSWER ===")
+    print(final_answer)
+    return final_answer
 
 # ---------------------------
-# TEST GOALS
+# TEST
 # ---------------------------
 if __name__ == "__main__":
     goals = [
-        "Is Bob Smith an owner?",
-        "List every tenant in the building.",
-        "Which apartment does Alice Johnson live in?",
         "Check if Carla Mendes is an owner and calculate 500*1.08",
-        "Calculate 42 / 7 and check if Alice Johnson is an owner"
+        "Calculate 42 / 7 and check if Alice Johnson is an owner",
+        "List every tenant in the building."
     ]
-
     for g in goals:
-        agentic_loop(g)
+        agentic_llm(g)
